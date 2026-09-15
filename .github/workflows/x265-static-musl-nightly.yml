@@ -1,0 +1,113 @@
+name: x265 static musl nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: x265-static-musl-nightly
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: https://github.com/Multicorewareinc/x265.git
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      changed: ${{ steps.source.outputs.changed }}
+
+    steps:
+      - name: Find upstream commit
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/x265/find-upstream.sh
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out upstream x265
+        uses: actions/checkout@v4
+        with:
+          repository: Multicorewareinc/x265
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+          path: x265
+
+      - name: Build static musl binary
+        shell: bash
+        run: ./scripts/x265/build.sh
+
+      - name: Validate binary and archive
+        shell: bash
+        working-directory: x265
+        run: "${GITHUB_WORKSPACE}/scripts/x265/validate.sh"
+
+      - name: Show generated files
+        shell: bash
+        working-directory: x265
+        run: |
+          set -euxo pipefail
+          find dist -maxdepth 1 -type f -printf "%p\n"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: x265-linux-x86_64-musl-static
+          path: ${{ github.workspace }}/x265/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs:
+      - prepare
+      - build
+    if: ${{ !cancelled() && needs.prepare.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: x265-linux-x86_64-musl-static
+          path: dist
+
+      - name: Validate downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f dist/x265-linux-x86_64-musl-static
+          test -f dist/x265-linux-x86_64-musl-static.sha256
+          test -f dist/x265-linux-x86_64-musl-static.tar.gz
+
+          (
+            cd dist
+            sha256sum --check x265-linux-x86_64-musl-static.sha256
+          )
+
+          tar -tzf dist/x265-linux-x86_64-musl-static.tar.gz
+
+      - name: Show downloaded files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find dist -type f -printf "%p\n"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        shell: bash
+        run: ./scripts/x265/publish.sh
