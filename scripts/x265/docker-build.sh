@@ -1,147 +1,176 @@
 #!/bin/sh
 set -eux
 
+src_dir=/src/source
+build_root=/src
+dist_dir=/src/dist
+
 apk add --no-cache \
-  build-base \
-  cmake \
-  git \
-  musl-dev \
-  nasm \
-  ninja \
-  tar \
-  zstd
+    build-base \
+    cmake \
+    git \
+    musl-dev \
+    nasm \
+    ninja \
+    tar \
+    zstd
 
-tar --version
-
-test -f source/CMakeLists.txt
+test -f "$src_dir/CMakeLists.txt"
 
 rm -rf \
-  build \
-  build-10 \
-  build-12 \
-  dist
+    "$build_root/build" \
+    "$build_root/build-10" \
+    "$build_root/build-12" \
+    "$dist_dir"
 
-mkdir -p dist
+mkdir -p "$build_root/build" "$dist_dir"
 
-# Force static linking while using Alpine's musl toolchain.
-cat > /usr/local/bin/musl-gcc-static <<'EOF'
-#!/bin/sh
-exec /usr/bin/gcc "$@" \
-  -static \
-  -static-libgcc \
-  -Wl,-Bstatic
-EOF
+cc=/usr/bin/gcc
+cxx=/usr/bin/g++
 
-cat > /usr/local/bin/musl-gxx-static <<'EOF'
-#!/bin/sh
-exec /usr/bin/g++ "$@" \
-  -static \
-  -static-libgcc \
-  -static-libstdc++ \
-  -Wl,-Bstatic
-EOF
+# Apply static options only when linking. Do not append linker flags to
+# every compiler invocation through a compiler wrapper.
+static_link_flags="-static -static-libgcc -static-libstdc++ -Wl,-Bstatic"
 
-chmod +x \
-  /usr/local/bin/musl-gcc-static \
-  /usr/local/bin/musl-gxx-static
+common_cmake_args="
+    -G Ninja
+    -D CMAKE_BUILD_TYPE=Release
+    -D CMAKE_C_COMPILER=$cc
+    -D CMAKE_CXX_COMPILER=$cxx
+    -D CMAKE_INSTALL_PREFIX=/usr
+    -D ENABLE_HDR10_PLUS=ON
+    -D ENABLE_SHARED=OFF
+    -D CMAKE_FIND_LIBRARY_SUFFIXES=.a
+    -D CMAKE_EXE_LINKER_FLAGS=$static_link_flags
+    -W no-dev
+"
 
-# Build the 10-bit static library.
-cmake -S source -B build-10 \
-  -G Ninja \
-  -D CMAKE_C_COMPILER=/usr/local/bin/musl-gcc-static \
-  -D CMAKE_CXX_COMPILER=/usr/local/bin/musl-gxx-static \
-  -D CMAKE_BUILD_TYPE=Release \
-  -D CMAKE_INSTALL_PREFIX=/usr \
-  -D ENABLE_HDR10_PLUS=TRUE \
-  -D ENABLE_CLI=FALSE \
-  -D ENABLE_SHARED=FALSE \
-  -D EXPORT_C_API=FALSE \
-  -D HIGH_BIT_DEPTH=TRUE \
-  -D CMAKE_FIND_LIBRARY_SUFFIXES=.a \
-  -W no-dev
+# ----------------------------------------------------------------------
+# Build the 12-bit library.
+# ----------------------------------------------------------------------
 
-cmake --build build-10
-test -f build-10/libx265.a
+cmake -S "$src_dir" -B "$build_root/build-12" \
+    $common_cmake_args \
+    -D ENABLE_CLI=OFF \
+    -D EXPORT_C_API=OFF \
+    -D HIGH_BIT_DEPTH=ON \
+    -D MAIN12=ON
 
-# Build the 12-bit static library.
-cmake -S source -B build-12 \
-  -G Ninja \
-  -D CMAKE_C_COMPILER=/usr/local/bin/musl-gcc-static \
-  -D CMAKE_CXX_COMPILER=/usr/local/bin/musl-gxx-static \
-  -D CMAKE_BUILD_TYPE=Release \
-  -D CMAKE_INSTALL_PREFIX=/usr \
-  -D ENABLE_HDR10_PLUS=TRUE \
-  -D ENABLE_CLI=FALSE \
-  -D ENABLE_SHARED=FALSE \
-  -D EXPORT_C_API=FALSE \
-  -D HIGH_BIT_DEPTH=TRUE \
-  -D MAIN12=TRUE \
-  -D CMAKE_FIND_LIBRARY_SUFFIXES=.a \
-  -W no-dev
+cmake --build "$build_root/build-12" --verbose
 
-cmake --build build-12
-test -f build-12/libx265.a
+test -f "$build_root/build-12/libx265.a"
 
-# Expose the additional bit-depth libraries to the final CLI build.
-mkdir -p build
+# ----------------------------------------------------------------------
+# Build the 10-bit library.
+# ----------------------------------------------------------------------
 
-ln -sfn /src/build-10/libx265.a \
-  /src/build/libx265_main10.a
+cmake -S "$src_dir" -B "$build_root/build-10" \
+    $common_cmake_args \
+    -D ENABLE_CLI=OFF \
+    -D EXPORT_C_API=OFF \
+    -D HIGH_BIT_DEPTH=ON
 
-ln -sfn /src/build-12/libx265.a \
-  /src/build/libx265_main12.a
+cmake --build "$build_root/build-10" --verbose
 
-# Build the final CLI with 8-bit, 10-bit, and 12-bit support.
-cmake -S source -B build \
-  -G Ninja \
-  -D CMAKE_C_COMPILER=/usr/local/bin/musl-gcc-static \
-  -D CMAKE_CXX_COMPILER=/usr/local/bin/musl-gxx-static \
-  -D CMAKE_BUILD_TYPE=Release \
-  -D CMAKE_INSTALL_PREFIX=/usr \
-  -D ENABLE_HDR10_PLUS=TRUE \
-  -D ENABLE_CLI=TRUE \
-  -D ENABLE_SHARED=FALSE \
-  -D EXTRA_LIB="x265_main10.a;x265_main12.a" \
-  -D EXTRA_LINK_FLAGS="-L/src/build -static -Wl,-Bstatic" \
-  -D LINKED_10BIT=TRUE \
-  -D LINKED_12BIT=TRUE \
-  -D CMAKE_FIND_LIBRARY_SUFFIXES=.a \
-  -D CMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -Wl,-Bstatic" \
-  -W no-dev
+test -f "$build_root/build-10/libx265.a"
 
-cmake --build build --verbose
+# ----------------------------------------------------------------------
+# Prepare the final 8-bit build directory.
+#
+# The names below are the names expected by x265's multilib CMake logic.
+# ----------------------------------------------------------------------
 
+ln -s "$build_root/build-10/libx265.a" \
+    "$build_root/build/libx265_main10.a"
+
+ln -s "$build_root/build-12/libx265.a" \
+    "$build_root/build/libx265_main12.a"
+
+# ----------------------------------------------------------------------
+# Build the CLI as an 8-bit build with linked 10-bit and 12-bit support.
+#
+# Do not set HIGH_BIT_DEPTH=ON here.
+# ----------------------------------------------------------------------
+
+cmake -S "$src_dir" -B "$build_root/build" \
+    $common_cmake_args \
+    -D ENABLE_CLI=ON \
+    -D EXPORT_C_API=ON \
+    -D LINKED_10BIT=ON \
+    -D LINKED_12BIT=ON \
+    -D EXTRA_LIB="x265_main10.a;x265_main12.a" \
+    -D EXTRA_LINK_FLAGS="-L$build_root/build"
+
+cmake --build "$build_root/build" --verbose
+
+# x265 normally places the executable in one of these locations.
 cli=""
 
-for candidate in build/x265 build/cli/x265; do
-  if [ -x "$candidate" ]; then
-    cli="$candidate"
-    break
-  fi
+for candidate in \
+    "$build_root/build/x265" \
+    "$build_root/build/cli/x265"
+do
+    if [ -x "$candidate" ]; then
+        cli="$candidate"
+        break
+    fi
 done
 
 test -n "$cli"
 
-cp "$cli" dist/x265-linux-x86_64-musl-static
-strip dist/x265-linux-x86_64-musl-static
+# The final CLI should identify itself as a multilib build.
+"$cli" --version
+
+# ----------------------------------------------------------------------
+# Combine the three static libraries into one multilib archive.
+#
+# This is useful if the resulting libx265.a is also consumed by another
+# static application.
+# ----------------------------------------------------------------------
+
+mv "$build_root/build/libx265.a" \
+   "$build_root/build/libx265_main.a"
+
+ar -M <<EOF
+CREATE $build_root/build/libx265.a
+ADDLIB $build_root/build/libx265_main.a
+ADDLIB $build_root/build/libx265_main10.a
+ADDLIB $build_root/build/libx265_main12.a
+SAVE
+END
+EOF
+
+test -f "$build_root/build/libx265.a"
+
+# ----------------------------------------------------------------------
+# Install the executable artifact.
+# ----------------------------------------------------------------------
+
+cp "$cli" "$dist_dir/x265-linux-x86_64-musl-static"
+
+strip "$dist_dir/x265-linux-x86_64-musl-static"
+
+file "$dist_dir/x265-linux-x86_64-musl-static"
+"$dist_dir/x265-linux-x86_64-musl-static" --version
 
 (
-  cd dist
-  sha256sum \
-    x265-linux-x86_64-musl-static \
-    > x265-linux-x86_64-musl-static.sha256
+    cd "$dist_dir"
+
+    sha256sum \
+        x265-linux-x86_64-musl-static \
+        > x265-linux-x86_64-musl-static.sha256
 )
 
 tar \
-  --sort=name \
-  --owner=0 \
-  --group=0 \
-  --numeric-owner \
-  -C dist \
-  -czf dist/x265-linux-x86_64-musl-static.tar.gz \
-  x265-linux-x86_64-musl-static \
-  x265-linux-x86_64-musl-static.sha256
+    --sort=name \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    -C "$dist_dir" \
+    -czf "$dist_dir/x265-linux-x86_64-musl-static.tar.gz" \
+    x265-linux-x86_64-musl-static \
+    x265-linux-x86_64-musl-static.sha256
 
-test -x dist/x265-linux-x86_64-musl-static
-test -f dist/x265-linux-x86_64-musl-static.sha256
-test -f dist/x265-linux-x86_64-musl-static.tar.gz
+test -x "$dist_dir/x265-linux-x86_64-musl-static"
+test -f "$dist_dir/x265-linux-x86_64-musl-static.sha256"
+test -f "$dist_dir/x265-linux-x86_64-musl-static.tar.gz"
