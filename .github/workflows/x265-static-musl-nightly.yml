@@ -1,122 +1,186 @@
-name: x265 static musl nightly
+#!/bin/sh
+set -eux
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 4 * * *"
+src_dir=/src/source
+build_root=/src
+dist_dir=/src/dist
 
-permissions:
-  contents: write
+apk add --no-cache \
+    build-base \
+    cmake \
+    git \
+    musl-dev \
+    nasm \
+    ninja \
+    tar \
+    zstd
 
-concurrency:
-  group: x265-static-musl-nightly
-  cancel-in-progress: true
+test -f "$src_dir/CMakeLists.txt"
 
-env:
-  UPSTREAM: https://github.com/Multicorewareinc/x265.git
+rm -rf \
+    "$build_root/build" \
+    "$build_root/build-10" \
+    "$build_root/build-12" \
+    "$dist_dir"
 
-jobs:
-  prepare:
-    runs-on: ubuntu-latest
+mkdir -p \
+    "$build_root/build" \
+    "$dist_dir"
 
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-      changed: ${{ steps.source.outputs.changed }}
+cc=/usr/bin/gcc
+cxx=/usr/bin/g++
 
-    steps:
-      - name: Check out this repository
-        uses: actions/checkout@v4
+# These options are passed to the linker only.
+static_link_flags="-static -static-libgcc -static-libstdc++ -Wl,-Bstatic"
 
-      - name: Find upstream commit
-        id: source
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash ./scripts/x265/find-upstream.sh
+configure_x265()
+{
+    build_dir=$1
+    shift
 
-  build:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.changed == 'true' }}
-    runs-on: ubuntu-latest
+    cmake \
+        -S "$src_dir" \
+        -B "$build_dir" \
+        -G Ninja \
+        "-DCMAKE_BUILD_TYPE=Release" \
+        "-DCMAKE_C_COMPILER=$cc" \
+        "-DCMAKE_CXX_COMPILER=$cxx" \
+        "-DCMAKE_INSTALL_PREFIX=/usr" \
+        "-DENABLE_HDR10_PLUS=ON" \
+        "-DENABLE_SHARED=OFF" \
+        "-DCMAKE_FIND_LIBRARY_SUFFIXES=.a" \
+        "-DCMAKE_EXE_LINKER_FLAGS=$static_link_flags" \
+        -Wno-dev \
+        "$@"
+}
 
-    steps:
-      - name: Check out this repository
-        uses: actions/checkout@v4
+# ----------------------------------------------------------------------
+# Build the 12-bit static library.
+# ----------------------------------------------------------------------
 
-      - name: Check out upstream x265
-        uses: actions/checkout@v4
-        with:
-          repository: Multicorewareinc/x265
-          ref: ${{ needs.prepare.outputs.sha }}
-          fetch-depth: 1
-          path: x265
+configure_x265 "$build_root/build-12" \
+    "-DENABLE_CLI=OFF" \
+    "-DEXPORT_C_API=OFF" \
+    "-DHIGH_BIT_DEPTH=ON" \
+    "-DMAIN12=ON"
 
-      - name: Build static musl binary
-        shell: bash
-        run: bash ./scripts/x265/build.sh
+cmake --build "$build_root/build-12" --verbose
 
-      - name: Validate binary and archive
-        shell: bash
-        working-directory: x265
-        run: bash "${GITHUB_WORKSPACE}/scripts/x265/validate.sh"
+test -f "$build_root/build-12/libx265.a"
 
-      - name: Show generated files
-        shell: bash
-        working-directory: x265
-        run: |
-          set -euxo pipefail
-          find dist -maxdepth 1 -type f -printf '%p\n'
+# ----------------------------------------------------------------------
+# Build the 10-bit static library.
+# ----------------------------------------------------------------------
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: x265-linux-x86_64-musl-static
-          path: ${{ github.workspace }}/x265/dist
-          if-no-files-found: error
-          retention-days: 14
+configure_x265 "$build_root/build-10" \
+    "-DENABLE_CLI=OFF" \
+    "-DEXPORT_C_API=OFF" \
+    "-DHIGH_BIT_DEPTH=ON"
 
-  publish:
-    needs:
-      - prepare
-      - build
-    if: ${{ !cancelled() && needs.prepare.outputs.changed == 'true' }}
-    runs-on: ubuntu-latest
+cmake --build "$build_root/build-10" --verbose
 
-    steps:
-      - name: Check out this repository
-        uses: actions/checkout@v4
+test -f "$build_root/build-10/libx265.a"
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: x265-linux-x86_64-musl-static
-          path: dist
+# ----------------------------------------------------------------------
+# Expose the additional bit-depth libraries to the final CLI build.
+# ----------------------------------------------------------------------
 
-      - name: Validate downloaded artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
+ln -s \
+    "$build_root/build-10/libx265.a" \
+    "$build_root/build/libx265_main10.a"
 
-          test -f dist/x265-linux-x86_64-musl-static
-          test -f dist/x265-linux-x86_64-musl-static.sha256
-          test -f dist/x265-linux-x86_64-musl-static.tar.gz
+ln -s \
+    "$build_root/build-12/libx265.a" \
+    "$build_root/build/libx265_main12.a"
 
-          (
-            cd dist
-            sha256sum --check x265-linux-x86_64-musl-static.sha256
-          )
+# ----------------------------------------------------------------------
+# Build the final 8-bit CLI with 10-bit and 12-bit support.
+#
+# HIGH_BIT_DEPTH is intentionally not enabled for this build.
+# ----------------------------------------------------------------------
 
-          tar -tzf dist/x265-linux-x86_64-musl-static.tar.gz
+configure_x265 "$build_root/build" \
+    "-DENABLE_CLI=ON" \
+    "-DEXPORT_C_API=ON" \
+    "-DLINKED_10BIT=ON" \
+    "-DLINKED_12BIT=ON" \
+    "-DEXTRA_LIB=x265_main10.a;x265_main12.a" \
+    "-DEXTRA_LINK_FLAGS=-L$build_root/build"
 
-      - name: Show downloaded files
-        shell: bash
-        run: |
-          set -euxo pipefail
-          find dist -type f -printf '%p\n'
+cmake --build "$build_root/build" --verbose
 
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.prepare.outputs.sha }}
-        shell: bash
-        run: bash ./scripts/x265/publish.sh
+# ----------------------------------------------------------------------
+# Locate the executable.
+# ----------------------------------------------------------------------
+
+cli=""
+
+for candidate in \
+    "$build_root/build/x265" \
+    "$build_root/build/cli/x265"
+do
+    if [ -x "$candidate" ]; then
+        cli=$candidate
+        break
+    fi
+done
+
+test -n "$cli"
+
+# Confirm that the binary starts before stripping it.
+"$cli" --version
+
+# ----------------------------------------------------------------------
+# Create a combined static library containing all three bit depths.
+# ----------------------------------------------------------------------
+
+if [ -f "$build_root/build/libx265.a" ]; then
+    mv \
+        "$build_root/build/libx265.a" \
+        "$build_root/build/libx265_main.a"
+fi
+
+ar -M <<EOF
+CREATE $build_root/build/libx265.a
+ADDLIB $build_root/build/libx265_main.a
+ADDLIB $build_root/build/libx265_main10.a
+ADDLIB $build_root/build/libx265_main12.a
+SAVE
+END
+EOF
+
+test -f "$build_root/build/libx265.a"
+
+# ----------------------------------------------------------------------
+# Package the CLI.
+# ----------------------------------------------------------------------
+
+output="$dist_dir/x265-linux-x86_64-musl-static"
+
+cp "$cli" "$output"
+strip "$output"
+
+file "$output"
+"$output" --version
+
+(
+    cd "$dist_dir"
+
+    sha256sum \
+        x265-linux-x86_64-musl-static \
+        > x265-linux-x86_64-musl-static.sha256
+)
+
+tar \
+    --sort=name \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    -C "$dist_dir" \
+    -czf "$dist_dir/x265-linux-x86_64-musl-static.tar.gz" \
+    x265-linux-x86_64-musl-static \
+    x265-linux-x86_64-musl-static.sha256
+
+test -x "$dist_dir/x265-linux-x86_64-musl-static"
+test -f "$dist_dir/x265-linux-x86_64-musl-static.sha256"
+test -f "$dist_dir/x265-linux-x86_64-musl-static.tar.gz"
